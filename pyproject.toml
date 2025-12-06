@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "galactic-rag"
+version = "0.1.0"
+description = "Toolkit for the Galactic Rag challenge built on top of datapizza-ai"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  {name = "Datapizza Challenge Team"},
+]
+dependencies = [
+  "datapizza-ai",
+  "datapizza-ai-parsers-docling",
+  "typer>=0.12.3",
+  "python-dotenv>=1.0.0",
+  "pandas>=2.2.3",
+  "tqdm>=4.66.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.4",
+  "ruff>=0.8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/galactic_rag"]
+
+# Uncomment the block below if you need to install datapizza-ai from the local checkout
+# (see /home/cris/dp_test/datapizza-ai/README.md for details). By default we pull the
+# published packages from PyPI.
+#
+# [tool.uv.sources]
+# datapizza-ai = { path = "../datapizza-ai" }
+# datapizza-ai-parsers-docling = { path = "../datapizza-ai/datapizza-ai-modules/parsers/docling" }
