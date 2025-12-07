@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 
 import typer
@@ -15,6 +16,7 @@ from datapizza.core.vectorstore import Distance, VectorConfig
 from datapizza.embedders import ChunkEmbedder
 from datapizza.embedders.google import GoogleEmbedder
 from datapizza.embedders.openai import OpenAIEmbedder
+from datapizza.clients.openai_like import OpenAILikeClient
 from datapizza.modules.parsers.docling import DoclingParser
 from datapizza.pipeline import IngestionPipeline
 from datapizza.type import (Chunk, DenseEmbedding, EmbeddingFormat, Node,
@@ -22,6 +24,7 @@ from datapizza.type import (Chunk, DenseEmbedding, EmbeddingFormat, Node,
 from datapizza.vectorstores.qdrant import QdrantVectorstore
 
 from galactic_rag.config import Settings, get_settings
+from galactic_rag.ingestion.utils.constant import INFO_EXTRACTION_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +51,6 @@ def _extract_heading_text(section: Node) -> str:
         if child.metadata.get("markdown_rendering") == "heading":
             return _clean_heading_text(child.content)
     return ""
-
-
-def _iter_section_children(node: Node) -> Iterable[Node]:
-    for child in node.children:
-        if child.node_type == NodeType.SECTION:
-            yield child
 
 
 def _section_plain_text(node: Node) -> str:
@@ -100,47 +97,49 @@ def _extract_page_numbers(metadata: dict) -> list[int]:
 
 def _looks_like_metadata_section(heading: str) -> bool:
     lowered = heading.lower()
-    forbidden = (
-        "ingredient",
-        "tecnica",
-        "prepar",
-        "proced",
-        "note",
-        "chef",
-        "ristorante",
-        "menu",
-        "introduzione",
+    non_dish = ("chef", "ristorante", "menu", "introduzione")
+    return _classify_metadata_heading(lowered) is not None or any(
+        key in lowered for key in non_dish
     )
-    return any(key in lowered for key in forbidden)
 
 
-def _collect_subsection_text(section: Node) -> dict[str, list[str]]:
+def _classify_metadata_heading(heading: str) -> str | None:
+    lowered = heading.lower()
+    if "ingredient" in lowered:
+        return "ingredients"
+    if any(key in lowered for key in ("tecnica", "prepar", "proced", "cottura")):
+        return "techniques"
+    if "note" in lowered:
+        return "notes"
+    return None
+
+
+# non esistono queste subsections, vanno trovate tra i fratelli successivi al massimo
+def _collect_following_metadata(
+    sections: Sequence[Node], start_idx: int, max_metadata_sections: int = 2
+) -> dict[str, list[str]]:
     result: dict[str, list[str]] = {
         "ingredients": [],
         "techniques": [],
         "notes": [],
     }
-    for child in section.children:
-        if child.node_type != NodeType.SECTION:
+    end_idx = min(len(sections), start_idx + 1 + max_metadata_sections)
+    for idx in range(start_idx + 1, end_idx):
+        section = sections[idx]
+        heading = _clean_heading_text(_extract_heading_text(section))
+        classification = _classify_metadata_heading(heading)
+        text = _section_body_text(section)
+        if classification:
+            if text:
+                result[classification].append(text)
             continue
-        heading = _clean_heading_text(_extract_heading_text(child)).lower()
-        text = _section_body_text(child)
-        if not text:
-            continue
-        if "ingredient" in heading:
-            result["ingredients"].append(text)
-        elif (
-            "tecnica" in heading
-            or "prepar" in heading
-            or "proced" in heading
-            or "cottura" in heading
-        ):
-            result["techniques"].append(text)
-        else:
+        if heading:
+            break
+        if text:
             result["notes"].append(text)
     return result
 
-
+# non esistono queste subsections, vanno trovate tra i fratelli successivi al massimo
 def _build_structured_text(
     *,
     restaurant: str,
@@ -176,8 +175,37 @@ def _origin_stem(document: Node) -> str:
     return ""
 
 
+
 class MenuSectionSplitter(PipelineComponent):
     """Custom splitter that extracts restaurant, chef and dishes as chunks."""
+    def __init__(self, llm: OpenAILikeClient | None = None):
+        self.llm = llm 
+
+    def _extract_with_llm(
+        self, *, dish_name: str, body: str
+    ) -> dict[str, list[str] | str] | None:
+        if not self.llm or not body:
+            return None
+        prompt = (
+            "Estrai nome piatto, ingredienti e tecniche dal seguente testo.\n"
+            "Rispondi solo con JSON: "
+            '{"dish_name": "...", "ingredients": ["..."], "techniques": ["..."], "notes": ["..."]}\n'
+            f"Titolo: {dish_name or 'n/d'}\n"
+            f"Testo: {body}"
+        )
+        try:
+            response = self.llm.invoke(input=prompt)
+            text = response.first_text or response.text
+            data = json.loads(text)
+            return {
+                "dish_name": str(data.get("dish_name", "")).strip(),
+                "ingredients": [i.strip() for i in data.get("ingredients", []) if i],
+                "techniques": [t.strip() for t in data.get("techniques", []) if t],
+                "notes": [n.strip() for n in data.get("notes", []) if n],
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("LLM extraction failed: %s", exc)
+            return None
 
     def _run(self, document: Node) -> list[Chunk]:
         sections = [
@@ -194,7 +222,7 @@ class MenuSectionSplitter(PipelineComponent):
         )
 
         chef_name = ""
-        for section in sections[1:3]:
+        for section in sections:
             heading = _clean_heading_text(_extract_heading_text(section)).lower()
             if "chef" in heading:
                 chef_name = re.sub(r"(?i)chef[:,\\-\\s]*", "", heading, count=1).strip()
@@ -211,39 +239,53 @@ class MenuSectionSplitter(PipelineComponent):
             if match:
                 chef_name = match.group(1).strip()
 
-        menu_section = None
-        for section in sections:
-            heading = _clean_heading_text(_extract_heading_text(section)).lower()
-            if "menu" in heading:
-                menu_section = section
-                break
-        if not menu_section and len(sections) >= 3:
-            menu_section = sections[2]
-        elif not menu_section:
-            menu_section = sections[-1]
-
-        dish_sections = self._collect_dish_sections(menu_section)
-        if not dish_sections:
-            dish_sections = sections[3:]
+        # Build dishes from sequential sections (metadata lives in following siblings)
+        dish_sections: list[tuple[int, Node]] = []
+        for idx, section in enumerate(sections):
+            if idx == 0:
+                continue
+            heading = _clean_heading_text(_extract_heading_text(section))
+            if not heading:
+                continue
+            if _looks_like_metadata_section(heading):
+                continue
+            dish_sections.append((idx, section))
 
         chunks: list[Chunk] = []
-        for dish_section in dish_sections:
+        # vedo sezione per sxeziojne se ha ingredienti e tecniche nel nome, in caso il contenuto lo metto nell'oggetto pydantic
+        # due oggetti pydanticun per documento e uno per piatto (un piatto e' un chunk) (prima del piatto c'e' il primo section che da info sul cuoco e la cucina)
+        # oggetto pydantic con dish name, description, ingredients, techniques
+        for idx, dish_section in dish_sections:
             dish_name = _clean_heading_text(_extract_heading_text(dish_section))
             if not dish_name:
                 continue
             pages = _extract_page_numbers(dish_section.metadata)
-            raw_text = _section_plain_text(dish_section)
-            if not raw_text:
+            raw_text = _section_body_text(dish_section)
+            subsections = _collect_following_metadata(sections, idx)
+            if not subsections["ingredients"] and not subsections["techniques"]:
+                llm_data = self._extract_with_llm(dish_name=dish_name, body=raw_text)
+                if llm_data:
+                    if llm_data.get("dish_name"):
+                        dish_name = llm_data["dish_name"]
+                    subsections["ingredients"] = llm_data.get("ingredients", [])
+                    subsections["techniques"] = llm_data.get("techniques", [])
+                    subsections["notes"] = llm_data.get("notes", [])
+            text_parts: list[str] = []
+            if raw_text:
+                text_parts.append(raw_text)
+            for bucket in ("ingredients", "techniques", "notes"):
+                text_parts.extend(subsections[bucket])
+            if not any(text_parts):
                 continue
-            subsections = _collect_subsection_text(dish_section)
             structured_text = _build_structured_text(
                 restaurant=restaurant_name,
                 chef=chef_name,
                 dish=dish_name,
-                body=raw_text,
+                body=raw_text or " ".join(text_parts),
                 pages=pages,
                 subsections=subsections,
             )
+            
             chunk_metadata = {
                 "restaurant": restaurant_name,
                 "chef": chef_name,
@@ -259,7 +301,7 @@ class MenuSectionSplitter(PipelineComponent):
             chunks.append(
                 Chunk(
                     id=str(uuid.uuid4()),
-                    text=raw_text,
+                    text=raw_text or " ".join(text_parts),
                     metadata=chunk_metadata,
                 )
             )
@@ -276,7 +318,7 @@ class MenuSectionSplitter(PipelineComponent):
                         chef=chef_name,
                         dish=restaurant_name or "menu",
                         body=document.content,
-                        pages=_extract_page_numbers(menu_section.metadata),
+                        pages=_extract_page_numbers(document.metadata),
                         subsections={"ingredients": [], "techniques": [], "notes": []},
                     ),
                 },
@@ -284,31 +326,6 @@ class MenuSectionSplitter(PipelineComponent):
             return [fallback]
 
         return chunks
-
-    def _collect_dish_sections(self, section: Node) -> list[Node]:
-        dishes: list[Node] = []
-        for child in _iter_section_children(section):
-            heading = _clean_heading_text(_extract_heading_text(child))
-            if not heading:
-                dishes.extend(self._collect_dish_sections(child))
-                continue
-            if _looks_like_metadata_section(heading):
-                dishes.extend(self._collect_dish_sections(child))
-                continue
-            grandchildren = [gc for gc in _iter_section_children(child)]
-            if not grandchildren:
-                dishes.append(child)
-                continue
-            if any(
-                _looks_like_metadata_section(
-                    _clean_heading_text(_extract_heading_text(gc))
-                )
-                for gc in grandchildren
-            ):
-                dishes.append(child)
-            else:
-                dishes.extend(self._collect_dish_sections(child))
-        return dishes
 
 
 class StructuredEmbeddingAugmenter(PipelineComponent):
@@ -402,7 +419,12 @@ def _build_pipeline(
     parser = DoclingParser(
         json_output_dir=str(json_output_dir) if json_output_dir else None
     )
-    splitter = MenuSectionSplitter()
+    llm = OpenAILikeClient(
+        api_key=settings.api_key,
+        model=settings.llm_model,
+        system_prompt=INFO_EXTRACTION_PROMPT,
+    )
+    splitter = MenuSectionSplitter(llm=llm)
     embedder_client = _build_embedder(settings)
     raw_name, context_name = _embedding_names(settings)
     chunk_embedder = ChunkEmbedder(
