@@ -6,3 +6,8 @@ uv.lock
 # Docs/notes
 PLAN.md
 setup.md
+notebooks/*
+
+.env
+Dataset/
+data/

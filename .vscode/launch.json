@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug ingestion",
+            "type": "python",
+            "request": "launch",
+            "module": "galactic_rag.ingestion.ingestion",
+            "justMyCode": false,
+            "args": [
+                "--recreate",
+                "--limit",
+                "1",
+                "--docling-json-dir",
+                "data/docling_json"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
+        }
+    ]
+}
