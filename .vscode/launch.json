@@ -18,6 +18,28 @@
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/src"
             }
+        },
+        {
+            "name": "Debug RAG answer",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "galactic_rag.run_questions",
+            "justMyCode": false,
+            "args": [
+                "answer",
+                "--questions-file",
+                "Dataset/domande.csv",
+                "--output-file",
+                "submission_debug.csv",
+                "--limit",
+                "3",
+                "--top-k",
+                "6"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            }
         }
     ]
 }

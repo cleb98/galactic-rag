@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, Iterable
 
 import typer
 from datapizza.core.embedder import BaseEmbedder
@@ -19,9 +19,9 @@ from datapizza.embedders.openai import OpenAIEmbedder
 from datapizza.clients.openai_like import OpenAILikeClient
 from datapizza.modules.parsers.docling import DoclingParser
 from datapizza.pipeline import IngestionPipeline
-from datapizza.type import (Chunk, DenseEmbedding, EmbeddingFormat, Node,
-                            NodeType)
+from datapizza.type import Chunk, DenseEmbedding, EmbeddingFormat, Node, NodeType
 from datapizza.vectorstores.qdrant import QdrantVectorstore
+from pydantic import BaseModel, Field, field_validator
 
 from galactic_rag.config import Settings, get_settings
 from galactic_rag.ingestion.utils.constant import INFO_EXTRACTION_PROMPT
@@ -94,52 +94,6 @@ def _extract_page_numbers(metadata: dict) -> list[int]:
         return [page_no]
     return []
 
-
-def _looks_like_metadata_section(heading: str) -> bool:
-    lowered = heading.lower()
-    non_dish = ("chef", "ristorante", "menu", "introduzione")
-    return _classify_metadata_heading(lowered) is not None or any(
-        key in lowered for key in non_dish
-    )
-
-
-def _classify_metadata_heading(heading: str) -> str | None:
-    lowered = heading.lower()
-    if "ingredient" in lowered:
-        return "ingredients"
-    if any(key in lowered for key in ("tecnica", "prepar", "proced", "cottura")):
-        return "techniques"
-    if "note" in lowered:
-        return "notes"
-    return None
-
-
-# non esistono queste subsections, vanno trovate tra i fratelli successivi al massimo
-def _collect_following_metadata(
-    sections: Sequence[Node], start_idx: int, max_metadata_sections: int = 2
-) -> dict[str, list[str]]:
-    result: dict[str, list[str]] = {
-        "ingredients": [],
-        "techniques": [],
-        "notes": [],
-    }
-    end_idx = min(len(sections), start_idx + 1 + max_metadata_sections)
-    for idx in range(start_idx + 1, end_idx):
-        section = sections[idx]
-        heading = _clean_heading_text(_extract_heading_text(section))
-        classification = _classify_metadata_heading(heading)
-        text = _section_body_text(section)
-        if classification:
-            if text:
-                result[classification].append(text)
-            continue
-        if heading:
-            break
-        if text:
-            result["notes"].append(text)
-    return result
-
-# non esistono queste subsections, vanno trovate tra i fratelli successivi al massimo
 def _build_structured_text(
     *,
     restaurant: str,
@@ -174,158 +128,360 @@ def _origin_stem(document: Node) -> str:
         return Path(file_path).stem.replace("_", " ")
     return ""
 
+class RestaurantInfo(BaseModel):
+    restaurant_name: str = Field(default="", description="The name of the restaurant")
+    chef_name: str = Field(default="", description="The name of the chef")
+    
+    @field_validator("restaurant_name", "chef_name", mode="before")
+    @classmethod
+    def _ensure_text(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+class MenuInfo(BaseModel):
+    dish_name: str = Field(default="", description="The name of the dish described")
+    ingredients: list[str] = Field(default_factory=list, description="List of ingredients used in the dish")
+    techniques: list[str] = Field(default_factory=list, description="List of techniques or preparation methods used in the dish")
+    notes: list[str] = Field(default_factory=list, description="Additional notes about the dish")
+
+    @field_validator("dish_name", mode="before")
+    @classmethod
+    def _ensure_text(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @field_validator("ingredients", "techniques", "notes", mode="before")
+    @classmethod
+    def _normalize_collection(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, list):
+            iterable = value
+        elif isinstance(value, (set, tuple)):
+            iterable = list(value)
+        else:
+            iterable = [value]
+
+        cleaned: list[str] = []
+        for item in iterable:
+            if not item:
+                continue
+            cleaned.append(str(item).strip())
+        return cleaned
+
+class ChunkMetadata(BaseModel):
+    num_pag: list[int] = Field(default_factory=list)
+    restaurant_info: RestaurantInfo = Field(default_factory=RestaurantInfo)
+    dish_info: list[MenuInfo] = Field(default_factory=list)
+    document_summary: str = ""
+
+
+
+
 
 
 class MenuSectionSplitter(PipelineComponent):
     """Custom splitter that extracts restaurant, chef and dishes as chunks."""
-    def __init__(self, llm: OpenAILikeClient | None = None):
-        self.llm = llm 
 
-    def _extract_with_llm(
-        self, *, dish_name: str, body: str
-    ) -> dict[str, list[str] | str] | None:
-        if not self.llm or not body:
+    def __init__(self, llm: OpenAILikeClient | None = None):
+        self.llm = llm
+        self.metadata: ChunkMetadata = ChunkMetadata()
+
+    def _extract_restaurant_info(
+        self, *, heading: str, body: str
+    ) -> RestaurantInfo | None:
+        if not self.llm:
             return None
         prompt = (
-            "Estrai nome piatto, ingredienti e tecniche dal seguente testo.\n"
+            "Estrai il nome del ristorante e dello chef dal seguente testo.\n"
+            "Se un'informazione manca rispondi con una stringa vuota.\n"
+            "Rispondi solo con JSON: "
+            '{"restaurant_name": "...", "chef_name": "..."}\n'
+            f"Titolo: {heading or 'n/d'}\n"
+            f"Testo: {body or 'n/d'}"
+        )
+        try:
+            response = self.llm.structured_response(
+                input=prompt,
+                output_cls=RestaurantInfo,
+            )
+            if response.structured_data:
+                return response.structured_data[0]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("LLM restaurant extraction failed: %s", exc)
+        return None
+
+    def _extract_dish_info_with_llm(
+        self, *, heading: str, body: str
+    ) -> MenuInfo | None:
+        if not self.llm or (not heading and not body):
+            return None
+        prompt = (
+            "Estrai nome piatto, ingredienti, tecniche e note dal seguente testo.\n"
             "Rispondi solo con JSON: "
             '{"dish_name": "...", "ingredients": ["..."], "techniques": ["..."], "notes": ["..."]}\n'
-            f"Titolo: {dish_name or 'n/d'}\n"
-            f"Testo: {body}"
+            f"Titolo: {heading or 'n/d'}\n"
+            f"Testo: {body or 'n/d'}"
+        )
+        try:
+            response = self.llm.structured_response(
+                input=prompt,
+                output_cls=MenuInfo,
+            )
+            if response.structured_data:
+                return response.structured_data[0]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("LLM dish extraction failed: %s", exc)
+        return None
+
+    def _generate_document_summary(
+        self, *, restaurant: RestaurantInfo, dishes: Sequence[MenuInfo]
+    ) -> str:
+        if not dishes:
+            base = (
+                f"Ristorante {restaurant.restaurant_name or 'sconosciuto'}"
+                f" guidato da {restaurant.chef_name or 'chef n/d'}."
+            )
+            return base.strip()
+
+        dish_lines = []
+        for info in dishes:
+            parts = [info.dish_name or "n/d"]
+            if info.ingredients:
+                parts.append("ingredienti: " + ", ".join(info.ingredients))
+            if info.techniques:
+                parts.append("tecniche: " + ", ".join(info.techniques))
+            dish_lines.append("; ".join(parts))
+
+        fallback_summary = (
+            f"Il menu del ristorante {restaurant.restaurant_name or 'n/d'}"
+            f" guidato da {restaurant.chef_name or 'n/d'} include {len(dishes)}"
+            " portate principali."
+        )
+
+        if not self.llm:
+            return fallback_summary
+
+        prompt = (
+            "Genera un breve riassunto (massimo tre frasi) del seguente menu.\n"
+            "Concentrati su atmosfera, cucina e punti salienti.\n"
+            f"Ristorante: {restaurant.restaurant_name or 'n/d'}\n"
+            f"Chef: {restaurant.chef_name or 'n/d'}\n"
+            "Piatti:\n"
+            + "\n".join(f"- {line}" for line in dish_lines[:15])
         )
         try:
             response = self.llm.invoke(input=prompt)
-            text = response.first_text or response.text
-            data = json.loads(text)
-            return {
-                "dish_name": str(data.get("dish_name", "")).strip(),
-                "ingredients": [i.strip() for i in data.get("ingredients", []) if i],
-                "techniques": [t.strip() for t in data.get("techniques", []) if t],
-                "notes": [n.strip() for n in data.get("notes", []) if n],
-            }
+            summary = response.text.strip()
+            return summary or fallback_summary
         except Exception as exc:  # noqa: BLE001
-            logger.warning("LLM extraction failed: %s", exc)
-            return None
+            logger.warning("LLM summary failed: %s", exc)
+            return fallback_summary
 
     def _run(self, document: Node) -> list[Chunk]:
+        """Split the document into chunks based on menu sections."""
+
+        self.metadata = ChunkMetadata()
+
         sections = [
             child for child in document.children if child.node_type == NodeType.SECTION
         ]
         if not sections:
             raise ValueError("Parsed document does not contain any sections")
 
-        restaurant_section = sections[0]
-        restaurant_name = (
-            _clean_heading_text(_extract_heading_text(restaurant_section))
-            or document.metadata.get("name")
-            or _origin_stem(document)
-        )
-
-        chef_name = ""
+        section_data: list[tuple[Node, str, str]] = []
         for section in sections:
-            heading = _clean_heading_text(_extract_heading_text(section)).lower()
-            if "chef" in heading:
-                chef_name = re.sub(r"(?i)chef[:,\\-\\s]*", "", heading, count=1).strip()
-                if not chef_name:
-                    chef_name = (
-                        _section_body_text(section).split("\n")[0].strip()
-                        if _section_body_text(section)
-                        else ""
-                    )
+            heading = _clean_heading_text(_extract_heading_text(section))
+            body = _section_body_text(section)
+            section_data.append((section, heading, body))
+
+        restaurant_name = ""
+        chef_name = ""
+        for _, heading, _ in section_data:
+            lowered = heading.lower()
+            if not restaurant_name and "ristorante" in lowered:
+                restaurant_name = re.sub(
+                    r"(?i)ristorante[:,\-\s]*",
+                    "",
+                    heading,
+                    count=1,
+                ).strip()
+            if not chef_name and "chef" in lowered:
+                chef_name = re.sub(
+                    r"(?i)chef[:,\-\s]*",
+                    "",
+                    heading,
+                    count=1,
+                ).strip()
+            if restaurant_name and chef_name:
                 break
-        if not chef_name and len(sections) > 1:
-            candidate_text = _section_body_text(sections[1])
-            match = re.search(r"(?i)chef[:\\-\\s]+([A-Za-z\\s']+)", candidate_text)
+
+        if not restaurant_name:
+            restaurant_name = (
+                section_data[0][1]
+                or document.metadata.get("name")
+                or _origin_stem(document)
+            )
+
+        document_body = "\n\n".join(body for _, _, body in section_data if body).strip()
+
+        if not chef_name and document_body:
+            match = re.search(
+                r"(?i)chef[:\-\s]+([A-Za-zÀ-ÖØ-öø-ÿ\s\"'\\]+)",
+                document_body,
+            )
             if match:
                 chef_name = match.group(1).strip()
 
-        # Build dishes from sequential sections (metadata lives in following siblings)
-        dish_sections: list[tuple[int, Node]] = []
-        for idx, section in enumerate(sections):
+        restaurant_info = RestaurantInfo(
+            restaurant_name=restaurant_name or "",
+            chef_name=chef_name or "",
+        )
+
+        dish_sections: list[tuple[Node, str, str, MenuInfo]] = []
+        for idx, (section, heading, body) in enumerate(section_data):
+            if self.llm and (
+                not restaurant_info.restaurant_name or not restaurant_info.chef_name
+            ):
+                llm_info = self._extract_restaurant_info(heading=heading, body=body)
+                if llm_info:
+                    if not restaurant_info.restaurant_name and llm_info.restaurant_name:
+                        restaurant_info.restaurant_name = llm_info.restaurant_name
+                    if not restaurant_info.chef_name and llm_info.chef_name:
+                        restaurant_info.chef_name = llm_info.chef_name
+
             if idx == 0:
                 continue
-            heading = _clean_heading_text(_extract_heading_text(section))
-            if not heading:
+
+            if not heading and not body:
                 continue
-            if _looks_like_metadata_section(heading):
+
+            menu_info = self._extract_dish_info_with_llm(heading=heading, body=body)
+            if not menu_info and (heading or body):
+                menu_info = MenuInfo(
+                    dish_name=heading or "",
+                    notes=[body] if body else [],
+                )
+
+            if not menu_info or not menu_info.dish_name:
                 continue
-            dish_sections.append((idx, section))
+
+            if not body and not (
+                menu_info.ingredients or menu_info.notes or menu_info.techniques
+            ):
+                continue
+
+            dish_sections.append((section, heading, body, menu_info))
+
+        if (
+            self.llm
+            and (not restaurant_info.restaurant_name or not restaurant_info.chef_name)
+            and document_body
+        ):
+            fallback_info = self._extract_restaurant_info(
+                heading=document.metadata.get("name") or section_data[0][1],
+                body=document_body,
+            )
+            if fallback_info:
+                if not restaurant_info.restaurant_name and fallback_info.restaurant_name:
+                    restaurant_info.restaurant_name = fallback_info.restaurant_name
+                if not restaurant_info.chef_name and fallback_info.chef_name:
+                    restaurant_info.chef_name = fallback_info.chef_name
+
+        if not restaurant_info.restaurant_name:
+            restaurant_info.restaurant_name = (
+                document.metadata.get("name") or _origin_stem(document) or ""
+            )
+
+        self.metadata.restaurant_info = restaurant_info
+        self.metadata.dish_info = [info[-1] for info in dish_sections]
+        self.metadata.document_summary = self._generate_document_summary(
+            restaurant=restaurant_info,
+            dishes=self.metadata.dish_info,
+        )
 
         chunks: list[Chunk] = []
-        # vedo sezione per sxeziojne se ha ingredienti e tecniche nel nome, in caso il contenuto lo metto nell'oggetto pydantic
-        # due oggetti pydanticun per documento e uno per piatto (un piatto e' un chunk) (prima del piatto c'e' il primo section che da info sul cuoco e la cucina)
-        # oggetto pydantic con dish name, description, ingredients, techniques
-        for idx, dish_section in dish_sections:
-            dish_name = _clean_heading_text(_extract_heading_text(dish_section))
-            if not dish_name:
-                continue
-            pages = _extract_page_numbers(dish_section.metadata)
-            raw_text = _section_body_text(dish_section)
-            subsections = _collect_following_metadata(sections, idx)
-            if not subsections["ingredients"] and not subsections["techniques"]:
-                llm_data = self._extract_with_llm(dish_name=dish_name, body=raw_text)
-                if llm_data:
-                    if llm_data.get("dish_name"):
-                        dish_name = llm_data["dish_name"]
-                    subsections["ingredients"] = llm_data.get("ingredients", [])
-                    subsections["techniques"] = llm_data.get("techniques", [])
-                    subsections["notes"] = llm_data.get("notes", [])
-            text_parts: list[str] = []
-            if raw_text:
-                text_parts.append(raw_text)
-            for bucket in ("ingredients", "techniques", "notes"):
-                text_parts.extend(subsections[bucket])
-            if not any(text_parts):
-                continue
+        for section, heading, body, menu_info in dish_sections:
+            pages = _extract_page_numbers(section.metadata)
             structured_text = _build_structured_text(
-                restaurant=restaurant_name,
-                chef=chef_name,
-                dish=dish_name,
-                body=raw_text or " ".join(text_parts),
+                restaurant=restaurant_info.restaurant_name,
+                chef=restaurant_info.chef_name,
+                dish=menu_info.dish_name or heading or restaurant_info.restaurant_name,
+                body=body,
                 pages=pages,
-                subsections=subsections,
+                subsections={
+                    "ingredients": menu_info.ingredients,
+                    "techniques": menu_info.techniques,
+                    "notes": menu_info.notes,
+                },
             )
-            
+            chunk_text_parts: list[str] = []
+            if body:
+                chunk_text_parts.append(body)
+            if menu_info.ingredients:
+                chunk_text_parts.append(
+                    "Ingredienti: " + ", ".join(menu_info.ingredients)
+                )
+            if menu_info.techniques:
+                chunk_text_parts.append(
+                    "Tecniche: " + ", ".join(menu_info.techniques)
+                )
+            if menu_info.notes:
+                chunk_text_parts.append("Note: " + " ".join(menu_info.notes))
+            chunk_text = "\n\n".join(part for part in chunk_text_parts if part).strip()
+            if not chunk_text:
+                chunk_text = structured_text
+
             chunk_metadata = {
-                "restaurant": restaurant_name,
-                "chef": chef_name,
-                "dish_name": dish_name,
-                "section_heading": dish_name,
+                "restaurant": restaurant_info.restaurant_name,
+                "chef": restaurant_info.chef_name,
+                "dish_name": menu_info.dish_name or heading,
+                "ingredients": menu_info.ingredients,
+                "techniques": menu_info.techniques,
+                "notes": menu_info.notes,
+                "section_heading": heading,
                 "pag_content": (
-                    dish_section.content.strip() if dish_section.content else raw_text
+                    section.content.strip() if section.content else body
                 ),
                 "num_pag": pages,
                 "page_numbers": pages,
                 "structured_text": structured_text,
+                "document_summary": self.metadata.document_summary,
+                "restaurant_info": restaurant_info.model_dump(),
+                "menu_info": menu_info.model_dump(),
+                "chunk_metadata": self.metadata.model_dump(),
             }
             chunks.append(
                 Chunk(
                     id=str(uuid.uuid4()),
-                    text=raw_text or " ".join(text_parts),
+                    text=chunk_text,
                     metadata=chunk_metadata,
                 )
             )
 
         if not chunks:
-            fallback = Chunk(
-                id=str(uuid.uuid4()),
-                text=document.content,
-                metadata={
-                    "restaurant": restaurant_name,
-                    "chef": chef_name,
-                    "structured_text": _build_structured_text(
-                        restaurant=restaurant_name,
-                        chef=chef_name,
-                        dish=restaurant_name or "menu",
-                        body=document.content,
-                        pages=_extract_page_numbers(document.metadata),
-                        subsections={"ingredients": [], "techniques": [], "notes": []},
-                    ),
-                },
+            fallback_text = document_body or document.content or section_data[0][1]
+            fallback_metadata = {
+                "restaurant": restaurant_info.restaurant_name,
+                "chef": restaurant_info.chef_name,
+                "document_summary": self.metadata.document_summary,
+                "restaurant_info": restaurant_info.model_dump(),
+                "chunk_metadata": self.metadata.model_dump(),
+            }
+            chunks.append(
+                Chunk(
+                    id=str(uuid.uuid4()),
+                    text=fallback_text or "",
+                    metadata=fallback_metadata,
+                )
             )
-            return [fallback]
 
         return chunks
+
 
 
 class StructuredEmbeddingAugmenter(PipelineComponent):
@@ -422,6 +578,7 @@ def _build_pipeline(
     llm = OpenAILikeClient(
         api_key=settings.api_key,
         model=settings.llm_model,
+        base_url=settings.base_url,
         system_prompt=INFO_EXTRACTION_PROMPT,
     )
     splitter = MenuSectionSplitter(llm=llm)
@@ -488,6 +645,7 @@ def ingest_data(
     """Ingest menu PDFs into the configured Qdrant vector store."""
 
     settings = get_settings()
+    logger.info("Provider: %s", settings.provider)
     target_dir = menu_dir or (settings.knowledge_base_dir / "menu")
     if not target_dir.exists():
         raise typer.BadParameter(f"Menu directory {target_dir} does not exist")
@@ -497,6 +655,8 @@ def ingest_data(
         raise typer.Exit("No PDF files found in menu directory")
     if limit > 0:
         pdfs = pdfs[:limit]
+
+    docling_json_dir = docling_json_dir or settings.docling_json_output_dir
 
     vectorstore = _build_vectorstore(settings)
     embedding_names = _embedding_names(settings)
