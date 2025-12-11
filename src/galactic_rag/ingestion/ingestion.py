@@ -8,7 +8,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, List
 
 import typer
 from datapizza.core.embedder import BaseEmbedder
@@ -38,19 +38,24 @@ def _embedding_names(settings: Settings) -> tuple[str, str]:
 
 
 def _clean_heading_text(text: str | None) -> str:
+    """Remove all leading markdown (#) heading markers from text."""
     if not text:
         return ""
     return re.sub(r"^#+\s*", "", text).strip()
 
 
 def _extract_heading_text(section: Node) -> str:
+    """Extract the heading text from a section node.
+    Looks for 'docling_raw' metadata first, then child nodes with
+    'markdown_rendering' set to 'heading.
+    """
     raw = section.metadata.get("docling_raw") or {}
     heading = raw.get("text")
     if heading:
         return heading.strip()
     for child in section.children:
         if child.metadata.get("markdown_rendering") == "heading":
-            return _clean_heading_text(child.content)
+            return child.content
     return ""
 
 
@@ -87,21 +92,6 @@ def _section_body_text(node: Node) -> str:
     return "\n\n".join(p for p in parts if p).strip()
 
 
-def _split_list_lines(text: str) -> list[str]:
-    items: list[str] = []
-    for raw in re.split(r"[\r\n]+", text):
-        cleaned = re.sub(r"^[\s•\-*\d\.)]+", "", raw or "").strip()
-        if cleaned:
-            items.append(cleaned)
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            ordered.append(item)
-    return ordered
-
-
 
 def _extract_page_numbers(metadata: dict) -> list[int]:
     if "page_nos" in metadata and isinstance(metadata["page_nos"], list):
@@ -109,7 +99,7 @@ def _extract_page_numbers(metadata: dict) -> list[int]:
     page_no = metadata.get("page_no")
     if isinstance(page_no, int):
         return [page_no]
-    return []
+    return 0
 
 # def _build_structured_text(
 #     *,
@@ -131,13 +121,6 @@ def _extract_page_numbers(metadata: dict) -> list[int]:
 #         parts.append("Note: " + " ".join(subsections["notes"]))
 #     return "\n".join(parts)
 
-
-def _origin_stem(document: Node) -> str:
-    origin = document.metadata.get("origin") or {}
-    file_path = origin.get("file_path") or origin.get("source") or ""
-    if file_path:
-        return Path(file_path).stem.replace("_", " ")
-    return ""
 
 class RestaurantInfo(BaseModel):
     restaurant_name: str = Field(default="", description="The name of the restaurant")
@@ -198,6 +181,13 @@ class MenuInfo(BaseModel):
 
 
 class DishInfo(BaseModel):
+    """Structured information about a dish extracted from the document.
+    """ 
+
+    heading: str = Field(
+        default="",
+        description="Heading of the chunk",
+    )
 
     dish_name: str = Field(
         default="",
@@ -215,10 +205,6 @@ class DishInfo(BaseModel):
         default_factory=list,
         description="Additional notes or remarks about the dish",
     )
-    num_pag: list[int] = Field(
-    default_factory=list,
-    description="List of page numbers where the dish is mentioned",
-)   
 
 
 class DocInfo(BaseModel):
@@ -241,6 +227,13 @@ class DocInfo(BaseModel):
         ),
     )
 
+class ChunkInfo(BaseModel):
+    heading: str
+    body: str
+    pag_number: List[int]
+    metadata: dict = {}
+
+
 
 class MenuSectionSplitter(PipelineComponent):
     """Custom splitter that extracts restaurant, chef and dishes as chunks."""
@@ -249,53 +242,23 @@ class MenuSectionSplitter(PipelineComponent):
         self.llm = llm
         # self.metadata: ChunkMetadata = ChunkMetadata()
 
-    def _extract_restaurant_info(
-        self, *, heading: str, body: str
-    ) -> RestaurantInfo | None:
-        if not self.llm:
-            return None
-        prompt = (
-            "Estrai il nome del ristorante e dello chef dal seguente testo.\n"
-            "Se un'informazione manca rispondi con una stringa vuota.\n"
-            "Rispondi solo con JSON: "
-            '{"restaurant_name": "...", "chef_name": "..."}\n'
-            f"Titolo: {heading or 'n/d'}\n"
-            f"Testo: {body or 'n/d'}"
-        )
-        logger.debug("Restaurant info extraction for heading: %s", heading )
-        try:
-            response = self.llm.structured_response(
-                input=prompt,
-                output_cls=RestaurantInfo,
-            )
-            if response.structured_data:
-                return response.structured_data[0]
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("LLM restaurant extraction failed: %s", exc)
-        return None
 
-
-    """
-    "Genera un breve riassunto in italiano del ristorante descritto nel testo seguente.\n"
-                F"Testo: {document_body or 'n/d'}"
-                f"Ristorante: {restaurant.restaurant_name or 'n/d'}\n"
-                f"Chef: {restaurant.chef_name or 'n/d'}\n"
-                "Includi il nome del ristorante, dello chef e una descrizione generale.\n"
-                "Rispondi in massimo 5 frasi.\n"
-    """
     def _extract_document_info(
-        self, *, document_body: str, restaurant: Optional[RestaurantInfo] = None
+        self, *, document: str
     ) -> DocInfo:
-        # TODO: use LLM to generate a better summary from the document body, restaraunt info and menu info
+        
+        """Extract structured document info using LLM."""
+        assert self.llm is not None, "LLM client is required for document info extraction"
+
         prompt = (
-            "Sei un assistente che aiuta a estrarre dati strutturati da un testo.\n"
+            "Sei un assistente che aiuta a estrarre dati strutturati dal testo di un chunk.\n"
             "Ogni testo descrive un ristorante e il suo menu.\n"
             "I menu descrivono in linguaggio naturale il ristorante, riportando il nome dello Chef, il nome del ristorante, (laddove presente) il pianeta su cui c'è il ristorante e le licenze culinarie che ha lo chef\n"
             "Ogni menu contiene 10 piatti\n"
             "Ogni piatto contiene gli ingredienti usati e le tecniche di preparazione\n"
             "Alcuni menu possiedono anche una descrizione in linguaggio naturale della preparazione\n"
             "Laddove vi siano certi ordini professionali, i menu lo citano\n"
-            f"Testo: {document_body}\n"
+            f"Testo del chunk: {document}\n"
 
             "# COME ESTRARE INFORMAZIONI DA UN TESTO\n"
             "Di seguito ti spiego come estrarre le info di un ristorante da un testo."
@@ -313,8 +276,6 @@ class MenuSectionSplitter(PipelineComponent):
                 input=prompt,
                 output_cls=DocInfo,
             )
-            # summary = response.structured_data.document_summary if response and response.structured_data else ""
-            # return summary
             return response.structured_data[0] 
         except Exception as exc:  # noqa: BLE001
             logger.warning("LLM generation failed: %s", exc)
@@ -328,82 +289,7 @@ class MenuSectionSplitter(PipelineComponent):
         4. Create chunks for each dish section with structured metadata.
         """
 
-        # self.metadata = ChunkMetadata()
-
-        sections = [
-            child for child in document.children if child.node_type == NodeType.SECTION
-        ]
-        if not sections:
-            raise ValueError("Parsed document does not contain any sections")
-
-        section_data: list[tuple[Node, str, str]] = []
-        chunks = []
-        document_txt = ""
-        for section in sections:
-            heading = _clean_heading_text(_extract_heading_text(section))
-            body = _section_body_text(section)
-            pag = _extract_page_numbers(section.metadata)
-            section_data.append((section, heading, body))
-
-            #concateno ogni heading e body per creare il testo completo del documento
-            chunk_info = {
-                "heading": heading,
-                "body": body,
-                "page_numbers": pag,
-            }
-
-            document_txt = "\n\n".join(
-                f"contenuto pagina {pag}\n{heading}\n{body}\nfine pagina {pag}" for _, heading, body in section_data
-            ).strip()
-
-        # restaurant_name = ""
-        # chef_name = ""
-        # for _, heading, _ in section_data:
-        #     lowered = heading.lower()
-        #     if not restaurant_name and "ristorante" in lowered:
-        #         restaurant_name = re.sub(
-        #             r"(?i)ristorante[:,\-\s]*",
-        #             "",
-        #             heading,
-        #             count=1,
-        #         ).strip()
-        #     if not chef_name and "chef" in lowered:
-        #         chef_name = re.sub(
-        #             r"(?i)chef[:,\-\s]*",
-        #             "",
-        #             heading,
-        #             count=1,
-        #         ).strip()
-        #     if restaurant_name and chef_name:
-        #         break
-
-        # if not restaurant_name:
-        #     fallback_heading = next(
-        #         (heading for _, heading, _ in section_data if heading), None
-        #     )
-        #     restaurant_name = (
-        #         fallback_heading
-        #         or document.metadata.get("name")
-        #         or _origin_stem(document)
-        #     )
-
-        # document_body = "\n\n".join(body for _, _, body in section_data if body).strip()
-
-        # if not chef_name and document_body:
-        #     match = re.search(
-        #         r"(?i)chef[:\-\s]+([A-Za-zÀ-ÖØ-öø-ÿ\s\"'\\]+)",
-        #         document_body,
-        #     )
-        #     if match:
-        #         chef_name = match.group(1).strip()
-
-        # restaurant_info = RestaurantInfo(
-        #     restaurant_name=restaurant_name or "",
-        #     chef_name=chef_name or "",
-        # )
-
-        # dish_sections: list[tuple[Node, str, str, MenuInfo]] = []
-        # skip_indices: set[int] = set()
+        """comment to be removed later
         # for idx, (section, heading, body) in enumerate(section_data):
 
         #     if idx in skip_indices:
@@ -465,61 +351,90 @@ class MenuSectionSplitter(PipelineComponent):
         #             continue
 
         #         break
+        """
+        sections = [
+            child for child in document.children if child.node_type == NodeType.SECTION
+        ]
+        if not sections:
+            raise ValueError("Parsed document does not contain any sections")
 
-            # menu_info = self._extract_menu_info(
-            #     section=section,
-            #     heading=heading,
-            #     body=body,
-            # )
+        section_data: list[tuple[Node, str, str]] = []
+        chunks_data: list[ChunkInfo] = []
+        document_txt = ""
+        chunk_to_skip: set[int] = set()
+        previous_page = -1
+        for i, section in enumerate(sections):
+            heading = _extract_heading_text(section)
+            body = _section_body_text(section)
+            pag = _extract_page_numbers(section.metadata)
+            # if pag == 1 and previous_page == -1:
+            #     document_txt += f"\n\n#pagina {pag}\n\n"
+            # if pag != previous_page and previous_page != -1: 
+            #     document_txt += f"\n\n#fine pagina {previous_page}\n\n"
+            #     document_txt += f"\n\n#pagina {pag}\n\n"     
 
-            # if ingredients:
-            #     for ingredient in ingredients:
-            #         if ingredient not in menu_info.ingredients:
-            #             menu_info.ingredients.append(ingredient)
-            # if techniques:
-            #     for technique in techniques:
-            #         if technique not in menu_info.techniques:
-            #             menu_info.techniques.append(technique)
-            # if notes:
-            #     for note in notes:
-            #         if note not in menu_info.notes:
-            #             menu_info.notes.append(note)
+            
+            document_txt += f"\n#HEADING:{heading}\nBODY:\n{body}\n".strip()
+            previous_page = pag
 
-            # if not menu_info.dish_name:
-            #     continue
+            # per ogni sezione devo vedere se i chunk successivi sono ingredients, techniques, notes
+            # in tal caso li aggiungo al body del chunk corrente e metterli in chunk_to_skip
+            # inoltre se il body e' vuoto, non creo il chunk pero lo agiungo a document_txt
 
-            # if not body and not (menu_info.ingredients or menu_info.techniques):
-            #     continue
+            if section.id in chunk_to_skip:
+                continue    
 
-            # dish_sections.append((section, heading, body, 
-            #                     #   menu_info
-            #                       ))
+            if not body:
+                continue
 
-        # if (not restaurant_info.restaurant_name or not restaurant_info.chef_name) and document_body:
-        #     fallback_info = self._extract_restaurant_info(
-        #         heading=document.metadata.get("name") or section_data[0][1],
-        #         body=document_body,
-        #     )
-        #     if fallback_info:
-        #         if not restaurant_info.restaurant_name and fallback_info.restaurant_name:
-        #             restaurant_info.restaurant_name = fallback_info.restaurant_name
-        #         if not restaurant_info.chef_name and fallback_info.chef_name:
-        #             restaurant_info.chef_name = fallback_info.chef_name
+            if section.id in chunk_to_skip:
+                continue
+            # aggiungo il testo di una sezione precedente al body corrente se e' ingredients, techniques, notes perche poi la skippo
+            lookahead = i + 1
+            while lookahead < len(sections):
+                next_section = sections[lookahead]
+                next_heading = _clean_heading_text(_extract_heading_text(next_section))
+                next_body = _section_body_text(next_section)
+                lowered_next = next_heading.lower()
 
-        # if not restaurant_info.restaurant_name:
-        #     restaurant_info.restaurant_name = (
-        #         document.metadata.get("name") or _origin_stem(document) or ""
-        #     )
+                if "ingredient" in lowered_next:
+                    if next_body:
+                        combined = f"{next_heading}\n{next_body}".strip()
+                        body = f"{body}\n\n{combined}" if body else combined
+                    chunk_to_skip.add(next_section.id)
+                    lookahead += 1
+                    continue
 
-        # self.metadata.restaurant_info = restaurant_info
-        # self.metadata.dish_info = [info[-1] for info in dish_sections]
-        # self.metadata.document_summary = self._generate_document_summary(
-        #     document_body=document_body,
-        #     restaurant=restaurant_info,
-        # )
+                if "tecnic" in lowered_next:
+                    if next_body:
+                        combined = f"{next_heading}\n{next_body}".strip()
+                        body = f"{body}\n\n{combined}" if body else combined
+                    chunk_to_skip.add(next_section.id)
+                    lookahead += 1
+                    continue
+
+                if "note" in lowered_next:
+                    if next_body:
+                        combined = f"{next_heading}\n{next_body}".strip()
+                        body = f"{body}\n\n{combined}" if body else combined
+                    chunk_to_skip.add(next_section.id)
+                    lookahead += 1
+                    continue
+
+                break
+
+
+            #concateno ogni heading e body per creare il testo completo del documento
+            chunk_info = ChunkInfo(
+                heading=heading,
+                body=body,
+                pag_number=pag,
+            )
+            chunks_data.append(chunk_info)
+           
 
         doc_info: DocInfo = self._extract_document_info(
-            document_body=document_txt,
+            document=document_txt
         )
         docs_data = doc_info.model_dump()
 
@@ -530,77 +445,29 @@ class MenuSectionSplitter(PipelineComponent):
         - cerco nella dish_list di doc_info se il piatto e' nel chunk tramite page number
         - creo il chunk con il testo e la metadata completa
         """
-        for chunk in c
+        final_chunks: list[Chunk] = []
+        for chunk in chunks_data: 
+            pag = chunk.pag_number
+            txt = f"{chunk.heading}\n{chunk.body}".strip()
+            # cerco il piatto nella doc_info.dish_info
+            # per ogni pages vedo se e' in doc_info.dish_info.num_pag
+           
+            for dish in doc_info.dish_info:
+                if chunk.heading.lower().strip() == dish.heading.lower().strip():
+                    chunk.metadata.update("restaurant_info", {
+                        "name": doc_info.restaurant_name,
+                        "chef_name": doc_info.chef_name,
+                    })
+                    chunk.metadata.update("dish_info", dish.model_dump())
 
-
-
-        # for section, heading, body, in dish_sections:
-        #     pages = _extract_page_numbers(section.metadata)
-            # structured_text = _build_structured_text(
-            #     restaurant=restaurant_info.restaurant_name,
-            #     chef=restaurant_info.chef_name,
-            #     dish=menu_info.dish_name or heading or restaurant_info.restaurant_name,
-            #     subsections={
-            #         "ingredients": menu_info.ingredients,
-            #         "techniques": menu_info.techniques,
-            #         "notes": menu_info.notes,
-            #     },
-            # )
-            # chunk_text_parts: list[str] = []
-            # if body:
-            #     chunk_text_parts.append(body)
-            # if menu_info.ingredients:
-            #     chunk_text_parts.append(
-            #         "Ingredienti: " + ", ".join(menu_info.ingredients)
-            #     )
-            # if menu_info.techniques:
-            #     chunk_text_parts.append(
-            #         "Tecniche: " + ", ".join(menu_info.techniques)
-            #     )
-            # if menu_info.notes:
-            #     chunk_text_parts.append("Note: " + " ".join(menu_info.notes))
-            # chunk_text = "\n\n".join(part for part in chunk_text_parts if part).strip()
-            # if not chunk_text:
-            #     chunk_text = structured_text
-
-            structured_text = doc_info.model_dump()
-            chunk_text = body or ""
-            chunk_metadata = structured_text.copy()
-            chunk_metadata.update(
-                {
-                    "num_pag": pages,
-                    "doc"
-                    # "structured_text": json.dumps(structured_text, ensure_ascii=False),
-                    # "structured_text": structured_text,
-                }
-            )
-            chunks.append(
+            final_chunks.append(
                 Chunk(
                     id=str(uuid.uuid4()),
-                    text=chunk_text,
-                    metadata=chunk_metadata,
+                    text=txt,
+                    metadata=chunk.metadata,
                 )
             )
-
-        # if not chunks:
-        #     logger.warning("No dish sections found, creating fallback chunk")
-        #     fallback_text = document_body or document.content or section_data[0][1]
-        #     fallback_metadata = {
-        #         "restaurant": restaurant_info.restaurant_name,
-        #         "chef": restaurant_info.chef_name,
-        #         "document_summary": self.metadata.document_summary,
-        #         "restaurant_info": restaurant_info.model_dump(),
-        #         "chunk_metadata": self.metadata.model_dump(),
-        #     }
-        #     chunks.append(
-        #         Chunk(
-        #             id=str(uuid.uuid4()),
-        #             text=fallback_text or "",
-        #             metadata=fallback_metadata,
-        #         )
-        #     )
-
-        return chunks
+        return final_chunks
 
 
 
@@ -620,7 +487,7 @@ class StructuredEmbeddingAugmenter(PipelineComponent):
     def _run(self, chunks: list[Chunk]) -> list[Chunk]:
         payloads: list[tuple[Chunk, str]] = []
         for chunk in chunks:
-            structured = chunk.metadata.get("structured_text")
+            structured = chunk.metadata
             if structured:
                 payloads.append((chunk, structured))
         if not payloads:
@@ -710,16 +577,16 @@ def _build_pipeline(
         embedding_name=raw_name,
         batch_size=batch_size,
     )
-    contextual_embedder = StructuredEmbeddingAugmenter(
-        client=embedder_client,
-        model_name=settings.embedding_model,
-        embedding_name=context_name,
-        batch_size=batch_size,
-    )
+    # contextual_embedder = StructuredEmbeddingAugmenter(
+    #     client=embedder_client,
+    #     model_name=settings.embedding_model,
+    #     embedding_name=context_name,
+    #     batch_size=batch_size,
+    # )
 
     return IngestionPipeline(
         modules=[parser, splitter, chunk_embedder, 
-                 contextual_embedder
+                #  contextual_embedder
                  ],
         vector_store=vectorstore,
         collection_name=settings.qdrant_collection,
