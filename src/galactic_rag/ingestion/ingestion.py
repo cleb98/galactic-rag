@@ -280,6 +280,7 @@ class MenuSectionSplitter(PipelineComponent):
         except Exception as exc:  # noqa: BLE001
             logger.warning("LLM generation failed: %s", exc)
         return ""       
+    
 
     def _run(self, document: Node) -> list[Chunk]:
         """Split the document into chunks based on menu sections.
@@ -358,34 +359,21 @@ class MenuSectionSplitter(PipelineComponent):
         if not sections:
             raise ValueError("Parsed document does not contain any sections")
 
-        section_data: list[tuple[Node, str, str]] = []
         chunks_data: list[ChunkInfo] = []
         document_txt = ""
         chunk_to_skip: set[int] = set()
-        previous_page = -1
+
         for i, section in enumerate(sections):
             heading = _extract_heading_text(section)
             body = _section_body_text(section)
             pag = _extract_page_numbers(section.metadata)
-            # if pag == 1 and previous_page == -1:
-            #     document_txt += f"\n\n#pagina {pag}\n\n"
-            # if pag != previous_page and previous_page != -1: 
-            #     document_txt += f"\n\n#fine pagina {previous_page}\n\n"
-            #     document_txt += f"\n\n#pagina {pag}\n\n"     
-
-            
             document_txt += f"\n#HEADING:{heading}\nBODY:\n{body}\n".strip()
-            previous_page = pag
-
             # per ogni sezione devo vedere se i chunk successivi sono ingredients, techniques, notes
             # in tal caso li aggiungo al body del chunk corrente e metterli in chunk_to_skip
             # inoltre se il body e' vuoto, non creo il chunk pero lo agiungo a document_txt
 
             if section.id in chunk_to_skip:
                 continue    
-
-            if not body:
-                continue
 
             # aggiungo il testo di una sezione precedente al body corrente se e' ingredients, techniques, notes perche poi la skippo
             lookahead = i + 1
@@ -420,6 +408,9 @@ class MenuSectionSplitter(PipelineComponent):
                     continue
 
                 break
+
+            if not body:
+                continue
 
 
             #concateno ogni heading e body per creare il testo completo del documento
