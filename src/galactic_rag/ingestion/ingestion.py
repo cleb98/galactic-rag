@@ -387,8 +387,6 @@ class MenuSectionSplitter(PipelineComponent):
             if not body:
                 continue
 
-            if section.id in chunk_to_skip:
-                continue
             # aggiungo il testo di una sezione precedente al body corrente se e' ingredients, techniques, notes perche poi la skippo
             lookahead = i + 1
             while lookahead < len(sections):
@@ -436,8 +434,6 @@ class MenuSectionSplitter(PipelineComponent):
         doc_info: DocInfo = self._extract_document_info(
             document=document_txt
         )
-        docs_data = doc_info.model_dump()
-
         # ora ho la lista di chunk
         """
         - per ogni chunk, ricostruisco il testo completo
@@ -449,16 +445,14 @@ class MenuSectionSplitter(PipelineComponent):
         for chunk in chunks_data: 
             pag = chunk.pag_number
             txt = f"{chunk.heading}\n{chunk.body}".strip()
-            # cerco il piatto nella doc_info.dish_info
-            # per ogni pages vedo se e' in doc_info.dish_info.num_pag
-           
+            # map dishes nella doc_info.dish_info
+            # per ogni piatto lo associo al chunk se il heading coincide
             for dish in doc_info.dish_info:
-                if chunk.heading.lower().strip() == dish.heading.lower().strip():
-                    chunk.metadata.update("restaurant_info", {
-                        "name": doc_info.restaurant_name,
-                        "chef_name": doc_info.chef_name,
-                    })
-                    chunk.metadata.update("dish_info", dish.model_dump())
+                chunk.metadata["restaurant_name"] = doc_info.restaurant_name
+                chunk.metadata["chef_name"] = doc_info.chef_name
+                chunk.metadata["summary"] = doc_info.document_summary
+                if _clean_heading_text(chunk.heading).lower().strip() == _clean_heading_text(dish.heading).lower().strip():
+                    chunk.metadata["dish_info"] = dish.model_dump()
 
             final_chunks.append(
                 Chunk(
@@ -577,12 +571,12 @@ def _build_pipeline(
         embedding_name=raw_name,
         batch_size=batch_size,
     )
-    # contextual_embedder = StructuredEmbeddingAugmenter(
-    #     client=embedder_client,
-    #     model_name=settings.embedding_model,
-    #     embedding_name=context_name,
-    #     batch_size=batch_size,
-    # )
+    contextual_embedder = StructuredEmbeddingAugmenter(
+        client=embedder_client,
+        model_name=settings.embedding_model,
+        embedding_name=context_name,
+        batch_size=batch_size,
+    )
 
     return IngestionPipeline(
         modules=[parser, splitter, chunk_embedder, 

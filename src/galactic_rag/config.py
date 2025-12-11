@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     qdrant_port: int = Field(default=6333, env="QDRANT_PORT")
     qdrant_api_key: str | None = Field(default=None, env="QDRANT_API_KEY")
     qdrant_https: bool = Field(default=False, env="QDRANT_HTTPS")
-    qdrant_collection: str = "galactic_menu"
+    qdrant_collection: str = Field(default="galactic_rag_collection", env="QDRANT_COLLECTION")
     chunk_max_chars: int = 1200
     embedding_dimensions_map: dict[str, int] = Field(
         default_factory=lambda: DEFAULT_EMBED_DIMENSIONS.copy()
