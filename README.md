@@ -1,8 +1,7 @@
 # Galactic RAG
 
-Pragmatic tooling that ingests the Hackapizza knowledge base with Datapizza AI and runs a Retrieval-Augmented Generation pipeline to answer every question.
-Are only supported the ingestion of menu PDFs in the Dataset/knowledge_base/menu and the RAG pipeline to answer questions about them.
-
+Pipeline that ingests the menu knowledge base with Datapizza AI and runs a RAG to answer every question related to the menus.
+> Are only supported the ingestion of menu PDFs in the Dataset/knowledge_base/menu and the RAG pipeline to answer questions about them.
 > The pipeline should reach a Jaccard similarity score: 25.6183% on the provided domande.csv dataset when using OpenAI as provider.
 
 ## Quick start
