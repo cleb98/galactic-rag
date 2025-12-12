@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
+from typing import Iterable
 
 from datapizza.clients.openai_like import OpenAILikeClient
 from datapizza.core.models import PipelineComponent
@@ -148,16 +150,24 @@ class ChunkPayload(BaseModel):
         )
 
 
-class RelevantChunk(BaseModel):
-    #
-    relevant: bool = Field(
-        ..., description="Indicates if the chunk is relevant to the query."
+class ChunkRelevanceDecision(BaseModel):
+    chunk_id: str = Field(..., description="Chunk identifier.")
+    relevant: bool = Field(..., description="True when the chunk helps answering.")
+
+
+class ChunkRelevanceBatch(BaseModel):
+    chunks: list[ChunkRelevanceDecision] = Field(
+        default_factory=list,
+        description="Per-chunk relevance decisions.",
     )
 
 
 class ChunkReranker(PipelineComponent):
-    def __init__(self, client: OpenAILikeClient | None = None):
+    def __init__(
+        self, client: OpenAILikeClient | None = None, *, batch_size: int = 5
+    ):
         self.client = client
+        self.batch_size = max(1, batch_size)
         self.prompt = (
             "Sei un assistente intelligente che identifica quali chunk sono rilevanti per rispondere alla domanda dell'utente."
             "Di se il chunk e' rilevante o meno\n\n"
@@ -167,6 +177,15 @@ class ChunkReranker(PipelineComponent):
             "{chunk}\n\n"
             "Concentrati sul capire se la domanda dell'utente puo' essere risolta usando le informazioni presenti nel chunk. (ingredienti, tecniche, ristorante, chef, descrizione del piatto)."
             "Se la domanda fa riferimento ad un ingredeinte di un piatto ad esempio cerca se fra quei ingredienti c'e' quello richiesto."
+        )
+        self.batch_prompt = (
+            "Sei un assistente intelligente che valuta piu' chunk contemporaneamente per rispondere alla domanda dell'utente.\n"
+            "Domanda dell'utente:\n"
+            "{user_prompt}\n\n"
+            "Per ogni chunk indica se e' rilevante per rispondere correttamente. Rispondi SOLO con JSON della forma "
+            '{{"chunks": [{{"chunk_id": "id_chunk", "relevant": true}}]}}\n'
+            "Chunk da analizzare:\n"
+            "{chunks}\n"
         )
 
     def _run(
@@ -179,22 +198,66 @@ class ChunkReranker(PipelineComponent):
 
         chunks_data = [ChunkPayload.from_chunk(chunk) for chunk in chunks]
         relevant_chunks: list[Chunk] = []
-        logger.info(f"Reranking  chunk")
-        for chunk_data in chunks_data:
-            try:
-                response = self.client.structured_response(
-                    input=self.prompt.format(user_prompt=user_prompt, chunk=chunk_data),
-                    output_cls=RelevantChunk,
-                )
-                if response.structured_data:
-                    relevant_chunk: RelevantChunk = response.structured_data[0]
-                    if relevant_chunk.relevant:
-                        relevant_chunks.append(chunk_data.to_chunk())
+        logger.info("Reranking %s chunks", len(chunks_data))
 
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Chunk reranker failed: %s", exc)
-                relevant_chunks.append(chunk_data.to_chunk())
+        for batch in self._batched(chunks_data):
+            batch_result = self._score_batch(user_prompt=user_prompt, batch=batch)
+            if not batch_result:
+                relevant_chunks.extend(chunk.to_chunk() for chunk in batch)
+                continue
+
+            relevant_ids = {
+                decision.chunk_id
+                for decision in batch_result.chunks
+                if decision.relevant
+            }
+            decided_ids = {decision.chunk_id for decision in batch_result.chunks}
+
+            for chunk_data in batch:
+                chunk = chunk_data.to_chunk()
+                if chunk_data.id not in decided_ids:
+                    relevant_chunks.append(chunk)
+                    continue
+                if chunk_data.id in relevant_ids:
+                    relevant_chunks.append(chunk)
         return relevant_chunks
+
+    def _score_batch(
+        self, *, user_prompt: str, batch: list[ChunkPayload]
+    ) -> ChunkRelevanceBatch | None:
+        formatted_chunks = "\n\n".join(
+            self._format_chunk(idx, chunk_data)
+            for idx, chunk_data in enumerate(batch, start=1)
+        )
+        try:
+            response = self.client.structured_response(
+                input=self.batch_prompt.format(
+                    user_prompt=user_prompt, chunks=formatted_chunks
+                ),
+                output_cls=ChunkRelevanceBatch,
+                temperature=0.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Chunk reranker batch failed: %s", exc)
+            return None
+
+        if not response.structured_data:
+            return None
+        return response.structured_data[0]
+
+    def _format_chunk(self, index: int, chunk_data: ChunkPayload) -> str:
+        metadata = chunk_data.metadata.model_dump(exclude_none=True)
+        metadata_json = json.dumps(metadata, ensure_ascii=True)
+        text = chunk_data.text.strip()
+        return (
+            f"[CHUNK {index}] ID: {chunk_data.id}\n"
+            f"Metadata: {metadata_json}\n"
+            f"Testo:\n{text}\n"
+        )
+
+    def _batched(self, data: list[ChunkPayload]) -> Iterable[list[ChunkPayload]]:
+        for start in range(0, len(data), self.batch_size):
+            yield data[start : start + self.batch_size]
 
 
 class FilterExtractor(PipelineComponent):
