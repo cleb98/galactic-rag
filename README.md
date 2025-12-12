@@ -41,7 +41,7 @@ Use the provided Docker Compose setup if you want a persistent Qdrant instance o
 2. `cp .env.example .env` and set `QDRANT_API_KEY` to any secret token you prefer.
 3. `docker compose up -d qdrant`
 
-The service now listens on `http://localhost:6333` (REST) and `6334` (gRPC) and requires the API key you set. Stop it with `docker compose down`. When connecting from notebooks/scripts instantiate `QdrantVectorstore(host="localhost", port=6333, api_key=os.environ["QDRANT_API_KEY"])`.
+The service now listens on `http://localhost:6333` (REST) and `6334` (gRPC) and requires the API key you set. Stop it with `docker compose down`.
 
 ## Menu ingestion
 
