@@ -10,3 +10,4 @@ notebooks/*
 
 .env
 data/docling_json/
+data/results/

@@ -1,6 +1,7 @@
 # Galactic RAG
 
 Pragmatic tooling that ingests the Hackapizza knowledge base with Datapizza AI and runs a Retrieval-Augmented Generation pipeline to answer every question.
+Are only supported the ingestion of menu PDFs in the Dataset/knowledge_base/menu and the RAG pipeline to answer questions about them.
 
 ## Quick start
 
@@ -33,6 +34,29 @@ Set `PROVIDER` in `.env` (`openai` or `gemini`) before running any ingestion or 
 - the LLM uses `gpt-4.1-mini-2025-04-14`.
 Make sure your `.env` contains valid API keys for the provider you choose.
 
+Be sure to set the Provider-specific configuration in `.env`:
+
+```env
+PROVIDER=openai # gemini
+
+# Provider: OpenAI
+OPENAI_API_KEY=sk-your-key
+OPENAI_MODEL=gpt-4.1-mini-2025-04-14
+# gpt-5-mini-2025-08-07 
+# gpt-4.1-mini-2025-04-14
+# gpt-5-nano-2025-08-07
+# gpt-5-mini-2025-08-07
+# gpt-4o-mini 
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+
+# Provider: Gemini
+GEMINI_API_KEY=your-gemini-api-key
+GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_EMBEDDING_MODEL=gemini-embedding-001
+```
+
 ### Run Qdrant locally (optional)
 
 Use the provided Docker Compose setup if you want a persistent Qdrant instance on `localhost:6333` (useful when experimenting from notebooks or external tools):
@@ -45,12 +69,27 @@ The service now listens on `http://localhost:6333` (REST) and `6334` (gRPC) and 
 
 ## Menu ingestion
 
-Run the Datapizza-style ingestion pipeline to parse every menu PDF and populate the local Qdrant collection:
+Run the Datapizza-style ingestion pipeline to parse every menu PDF and populate the local Qdrant collection.
 
 ```bash
 source .venv/bin/activate
 python -m galactic_rag.ingestion.ingestion --recreate
 ```
+
+I suggest to use the a persistent Qdrant instance on `localhost:6333` for ingestion because is the one tested with the RAG pipeline. Make sure your `.env` contains the correct connection settings.
+
+### Qdrant connection (leave QDRANT_HOST empty to fall back to local `data/vectorstore`)
+```env
+QDRANT_API_KEY=your-qdrant-api-key
+QDRANT_HOST=localhost
+QDRANT_PORT=6333
+QDRANT_HTTPS=false
+QDRANT_COLLECTION=galactic_menu
+```
+
+
+
+
 
 This command:
 
@@ -78,3 +117,5 @@ python -m galactic_rag.run_questions answer \
 ```
 
 `questions-file` defaults to the dataset CSV configured in `Settings.domande_csv`, so you can usually omit it unless you want to point at another CSV. Use `--limit N` or `--skip N` to benchmark a subset of questions, and `--top-k` to control how many chunks the retriever surfaces for each query. The script automatically initializes the configured Qdrant vector store and writes the answers to the path you pass via `--output-file`.
+
+> Further options are available; run python -m galactic_rag.run_questions --help to see them all.
