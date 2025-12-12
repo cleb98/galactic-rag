@@ -2,30 +2,29 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, List
 
 import typer
+from datapizza.clients.openai_like import OpenAILikeClient
 from datapizza.core.embedder import BaseEmbedder
 from datapizza.core.models import PipelineComponent
 from datapizza.core.vectorstore import Distance, VectorConfig
 from datapizza.embedders import ChunkEmbedder
 from datapizza.embedders.google import GoogleEmbedder
 from datapizza.embedders.openai import OpenAIEmbedder
-from datapizza.clients.openai_like import OpenAILikeClient
 from datapizza.modules.parsers.docling import DoclingParser
 from datapizza.pipeline import IngestionPipeline
-from datapizza.type import Chunk, DenseEmbedding, EmbeddingFormat, Node, NodeType
+from datapizza.type import Chunk, EmbeddingFormat, Node, NodeType
 from datapizza.vectorstores.qdrant import QdrantVectorstore
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 from galactic_rag.config import Settings, get_settings
-from galactic_rag.ingestion.utils.constant import INFO_EXTRACTION_PROMPT
+from galactic_rag.ingestion.utils.constant import (
+    EXTRACTION_EXPLANATION_PROMPT, INFO_EXTRACTION_PROMPT)
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +91,6 @@ def _section_body_text(node: Node) -> str:
     return "\n\n".join(p for p in parts if p).strip()
 
 
-
 def _extract_page_numbers(metadata: dict) -> list[int]:
     if "page_nos" in metadata and isinstance(metadata["page_nos"], list):
         return [int(p) for p in metadata["page_nos"] if isinstance(p, int)]
@@ -101,88 +99,9 @@ def _extract_page_numbers(metadata: dict) -> list[int]:
         return [page_no]
     return 0
 
-# def _build_structured_text(
-#     *,
-#     # restaurant: str,
-#     # chef: str,
-#     # dish: str,
-#     # subsections: dict[str, list[str]],
-# ) -> str:
-#     parts = [
-#         f"Ristorante: {restaurant or 'n/d'}",
-#         f"Chef: {chef or 'n/d'}",
-#         f"Piatto: {dish}",
-#     ]
-#     if subsections["ingredients"]:
-#         parts.append("Ingredienti: " + " ".join(subsections["ingredients"]))
-#     if subsections["techniques"]:
-#         parts.append("Tecniche: " + " ".join(subsections["techniques"]))
-#     if subsections["notes"]:
-#         parts.append("Note: " + " ".join(subsections["notes"]))
-#     return "\n".join(parts)
-
-
-class RestaurantInfo(BaseModel):
-    restaurant_name: str = Field(default="", description="The name of the restaurant")
-    chef_name: str = Field(default="", description="The name of the chef")
-    
-    @field_validator("restaurant_name", "chef_name", mode="before")
-    @classmethod
-    def _ensure_text(cls, value: Any) -> str:
-        if value is None:
-            return ""
-        return str(value).strip()
-
-class MenuInfo(BaseModel):
-    dish_name: str = Field(default="", description="The name of the dish described")
-    ingredients: list[str] = Field(default_factory=list, description="List of ingredients used in the dish")
-    techniques: list[str] = Field(default_factory=list, description="List of techniques or preparation methods used in the dish")
-    notes: list[str] = Field(default_factory=list, description="Additional notes about the dish")
-
-    @field_validator("dish_name", mode="before")
-    @classmethod
-    def _ensure_text(cls, value: Any) -> str:
-        if value is None:
-            return ""
-        return str(value).strip()
-
-    @field_validator("ingredients", "techniques", "notes", mode="before")
-    @classmethod
-    def _normalize_collection(cls, value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, str):
-            value = [value]
-        if isinstance(value, list):
-            iterable = value
-        elif isinstance(value, (set, tuple)):
-            iterable = list(value)
-        else:
-            iterable = [value]
-
-        cleaned: list[str] = []
-        for item in iterable:
-            if not item:
-                continue
-            cleaned.append(str(item).strip())
-        return cleaned
-
-# class ChunkMetadata(BaseModel):
-#     num_pag: list[int] = Field(default_factory=list)
-#     restaurant_info: RestaurantInfo = Field(default_factory=RestaurantInfo)
-#     dish_info: list[MenuInfo] = Field(
-#         default_factory=list,
-#         description="List of dishes described in the document",
-#     )
-#     document_summary: str = Field(
-#         default="",
-#         description="Short summary of the restaurant and its menu extracted from the document",
-#     )
-
 
 class DishInfo(BaseModel):
-    """Structured information about a dish extracted from the document.
-    """ 
+    """Structured information about a dish extracted from the document."""
 
     heading: str = Field(
         default="",
@@ -222,17 +141,15 @@ class DocInfo(BaseModel):
     )
     dish_info: list[DishInfo] = Field(
         default_factory=list,
-        description=(
-            "List of dishes described in the document with their details"
-        ),
+        description=("List of dishes described in the document with their details"),
     )
+
 
 class ChunkInfo(BaseModel):
     heading: str
     body: str
-    pag_number: List[int]
+    pag_number: list[int]
     metadata: dict = {}
-
 
 
 class MenuSectionSplitter(PipelineComponent):
@@ -240,47 +157,23 @@ class MenuSectionSplitter(PipelineComponent):
 
     def __init__(self, llm: OpenAILikeClient | None = None):
         self.llm = llm
-        # self.metadata: ChunkMetadata = ChunkMetadata()
 
-
-    def _extract_document_info(
-        self, *, document: str
-    ) -> DocInfo:
-        
+    def _extract_document_info(self, *, document: str) -> DocInfo:
         """Extract structured document info using LLM."""
-        assert self.llm is not None, "LLM client is required for document info extraction"
+        assert (
+            self.llm is not None
+        ), "LLM client is required for document info extraction"  
 
-        prompt = (
-            "Sei un assistente che aiuta a estrarre dati strutturati dal testo di un chunk.\n"
-            "Ogni testo descrive un ristorante e il suo menu.\n"
-            "I menu descrivono in linguaggio naturale il ristorante, riportando il nome dello Chef, il nome del ristorante, (laddove presente) il pianeta su cui c'è il ristorante e le licenze culinarie che ha lo chef\n"
-            "Ogni menu contiene 10 piatti\n"
-            "Ogni piatto contiene gli ingredienti usati e le tecniche di preparazione\n"
-            "Alcuni menu possiedono anche una descrizione in linguaggio naturale della preparazione\n"
-            "Laddove vi siano certi ordini professionali, i menu lo citano\n"
-            f"Testo del chunk: {document}\n"
-
-            "# COME ESTRARE INFORMAZIONI DA UN TESTO\n"
-            "Di seguito ti spiego come estrarre le info di un ristorante da un testo."
-            "chef_name: str estrarre il nome dello chef dal testo.\n"
-            "restaurant_name: str estrarre il nome del ristorante dal testo.\n"
-            "document_summary: str Genera un breve riassunto in italiano con massimo 5 frasi del ristorante descritto nel testo seguente.\n"
-            "dish_info: list[DishInfo] Estrai le informazioni sui piatti presenti nel menu e la pagina in cui sono menzionati.\n"
-            "Includi il nome del ristorante, dello chef e una descrizione generale.\n"
-            
-
-            
-        )
+        prompt = EXTRACTION_EXPLANATION_PROMPT.format(document=document)
         try:
             response = self.llm.structured_response(
                 input=prompt,
                 output_cls=DocInfo,
             )
-            return response.structured_data[0] 
+            return response.structured_data[0]
         except Exception as exc:  # noqa: BLE001
             logger.warning("LLM generation failed: %s", exc)
-        return ""       
-    
+        return ""
 
     def _run(self, document: Node) -> list[Chunk]:
         """Split the document into chunks based on menu sections.
@@ -288,70 +181,6 @@ class MenuSectionSplitter(PipelineComponent):
         2. For each section, extract dish name, ingredients, techniques, and notes if possible.
         3. Generate a summary of the document using the extracted information and the whole document body.
         4. Create chunks for each dish section with structured metadata.
-        """
-
-        """comment to be removed later
-        # for idx, (section, heading, body) in enumerate(section_data):
-
-        #     if idx in skip_indices:
-        #         continue
-
-        #     if not body:
-        #         continue
-
-        #     if (
-        #         re.search(
-        #             r"(?i)chef[:\-\s]+([A-Za-zÀ-ÖØ-öø-ÿ\s\"'\\]+)", # es: chef: Mario Rossi
-        #             heading,    
-        #         )
-        #         or re.search(
-        #                 r"(?i)ristorante[:\-\s]+([A-Za-zÀ-ÖØ-öø-ÿ\s\"'\\]+)", # es: ristorante: Datapizza
-        #                 heading,
-        #             )
-        #         or re.search(
-        #             r"(?i)\bmenu\b", # es: "Menu del giorno" / "Menu"
-        #             heading,
-        #         )
-        #     ):
-        #         continue
-
-        #     ingredients: list[str] = []
-        #     techniques: list[str] = []
-        #     notes: list[str] = []
-
-        #     lookahead = idx + 1
-        #     while lookahead < len(section_data):
-        #         _, next_heading, next_body = section_data[lookahead]
-        #         lowered_next = next_heading.lower()
-
-        #         if "ingredient" in lowered_next:
-        #             if next_body:
-        #                 ingredients.extend(_split_list_lines(next_body))
-        #                 combined = f"{next_heading}\n{next_body}".strip()
-        #                 body = f"{body}\n\n{combined}" if body else combined
-        #             skip_indices.add(lookahead)
-        #             lookahead += 1
-        #             continue
-
-        #         if "tecnic" in lowered_next:
-        #             if next_body:
-        #                 techniques.extend(_split_list_lines(next_body))
-        #                 combined = f"{next_heading}\n{next_body}".strip()
-        #                 body = f"{body}\n\n{combined}" if body else combined
-        #             skip_indices.add(lookahead)
-        #             lookahead += 1
-        #             continue
-
-        #         if "note" in lowered_next:
-        #             if next_body:
-        #                 notes.extend(_split_list_lines(next_body))
-        #                 combined = f"{next_heading}\n{next_body}".strip()
-        #                 body = f"{body}\n\n{combined}" if body else combined
-        #             skip_indices.add(lookahead)
-        #             lookahead += 1
-        #             continue
-
-        #         break
         """
         sections = [
             child for child in document.children if child.node_type == NodeType.SECTION
@@ -373,7 +202,7 @@ class MenuSectionSplitter(PipelineComponent):
             # inoltre se il body e' vuoto, non creo il chunk pero lo agiungo a document_txt
 
             if section.id in chunk_to_skip:
-                continue    
+                continue
 
             # aggiungo il testo di una sezione precedente al body corrente se e' ingredients, techniques, notes perche poi la skippo
             lookahead = i + 1
@@ -412,19 +241,15 @@ class MenuSectionSplitter(PipelineComponent):
             if not body:
                 continue
 
-
-            #concateno ogni heading e body per creare il testo completo del documento
+            # concateno ogni heading e body per creare il testo completo del documento
             chunk_info = ChunkInfo(
                 heading=heading,
                 body=body,
                 pag_number=pag,
             )
             chunks_data.append(chunk_info)
-           
 
-        doc_info: DocInfo = self._extract_document_info(
-            document=document_txt
-        )
+        doc_info: DocInfo = self._extract_document_info(document=document_txt)
         # ora ho la lista di chunk
         """
         - per ogni chunk, ricostruisco il testo completo
@@ -433,7 +258,7 @@ class MenuSectionSplitter(PipelineComponent):
         - creo il chunk con il testo e la metadata completa
         """
         final_chunks: list[Chunk] = []
-        for chunk in chunks_data: 
+        for chunk in chunks_data:
             pag = chunk.pag_number
             txt = f"{chunk.heading}\n{chunk.body}".strip()
             # map dishes nella doc_info.dish_info
@@ -442,7 +267,10 @@ class MenuSectionSplitter(PipelineComponent):
                 chunk.metadata["restaurant_name"] = doc_info.restaurant_name
                 chunk.metadata["chef_name"] = doc_info.chef_name
                 chunk.metadata["summary"] = doc_info.document_summary
-                if _clean_heading_text(chunk.heading).lower().strip() == _clean_heading_text(dish.heading).lower().strip():
+                if (
+                    _clean_heading_text(chunk.heading).lower().strip()
+                    == _clean_heading_text(dish.heading).lower().strip()
+                ):
                     chunk.metadata["dish_info"] = dish.model_dump()
 
             final_chunks.append(
@@ -453,40 +281,6 @@ class MenuSectionSplitter(PipelineComponent):
                 )
             )
         return final_chunks
-
-
-
-class StructuredEmbeddingAugmenter(PipelineComponent):
-    def __init__(
-        self,
-        client: BaseEmbedder,
-        model_name: str,
-        embedding_name: str,
-        batch_size: int = 64,
-    ):
-        self.client = client
-        self.model_name = model_name
-        self.embedding_name = embedding_name
-        self.batch_size = batch_size
-
-    def _run(self, chunks: list[Chunk]) -> list[Chunk]:
-        payloads: list[tuple[Chunk, str]] = []
-        for chunk in chunks:
-            structured = chunk.metadata
-            if structured:
-                payloads.append((chunk, structured))
-        if not payloads:
-            return chunks
-
-        for start in range(0, len(payloads), self.batch_size):
-            batch = payloads[start : start + self.batch_size]
-            texts = [text for _, text in batch]
-            embeddings = self.client.embed(texts, self.model_name)
-            for (chunk, _), vector in zip(batch, embeddings, strict=False):
-                chunk.embeddings.append(
-                    DenseEmbedding(name=self.embedding_name, vector=vector)
-                )
-        return chunks
 
 
 def _build_embedder(settings: Settings) -> BaseEmbedder:
@@ -562,17 +356,14 @@ def _build_pipeline(
         embedding_name=raw_name,
         batch_size=batch_size,
     )
-    contextual_embedder = StructuredEmbeddingAugmenter(
-        client=embedder_client,
-        model_name=settings.embedding_model,
-        embedding_name=context_name,
-        batch_size=batch_size,
-    )
 
     return IngestionPipeline(
-        modules=[parser, splitter, chunk_embedder, 
-                #  contextual_embedder
-                 ],
+        modules=[
+            parser,
+            splitter,
+            chunk_embedder,
+            #  contextual_embedder
+        ],
         vector_store=vectorstore,
         collection_name=settings.qdrant_collection,
     )

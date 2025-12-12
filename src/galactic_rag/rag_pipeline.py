@@ -7,8 +7,8 @@ from pathlib import Path
 
 from datapizza.clients.openai_like import OpenAILikeClient
 from datapizza.core.models import PipelineComponent
-from datapizza.embedders.openai import OpenAIEmbedder
 from datapizza.embedders.google import GoogleEmbedder
+from datapizza.embedders.openai import OpenAIEmbedder
 from datapizza.memory import Memory
 from datapizza.modules.prompt.prompt import ChatPromptTemplate
 from datapizza.modules.rewriters.tool_rewriter import ToolRewriter
@@ -16,19 +16,18 @@ from datapizza.pipeline import DagPipeline
 from datapizza.type import Chunk
 from datapizza.vectorstores.qdrant import QdrantVectorstore
 from pydantic import BaseModel, Field, field_validator
+
 from galactic_rag.config import Settings
 from galactic_rag.rag_postprocess import DishPostProcessor
 
 logger = logging.getLogger(__name__)
 
-REWRITER_SYSTEM_PROMPT = (
-    "Sei un assistente intelligente che riformula le domande degli utenti cosi da aumentare la accuracy del sistema di retrieval. "
-)
+REWRITER_SYSTEM_PROMPT = "Sei un assistente intelligente che riformula le domande degli utenti cosi da aumentare la accuracy del sistema di retrieval. "
 
 ANSWER_SYSTEM_PROMPT = (
     "Sei uno chef enciclopedico. Usa solo i documenti forniti per individuare i piatti "
     "galattici richiesti. Rispondi esclusivamente con JSON della forma "
-    '{"piatti": ["nome piatto 1", "nome piatto 2"]}' 
+    '{"piatti": ["nome piatto 1", "nome piatto 2"]}'
     "Se non sei certo, scegli i piatti "
     "più pertinenti in base ai documenti."
 )
@@ -78,7 +77,9 @@ class QueryEmbedder(PipelineComponent):
         self.embedder = embedder
         self.model_name = model_name
 
-    def _run(self, text: str | None = None, fallback_prompt: str | None = None) -> list[float]:
+    def _run(
+        self, text: str | None = None, fallback_prompt: str | None = None
+    ) -> list[float]:
         query_text = (text or fallback_prompt or "").strip()
         if not query_text:
             raise ValueError("QueryEmbedder received an empty query")
@@ -107,25 +108,113 @@ class PromptBuilder(PipelineComponent):
         )
 
 
+class DishInfo(BaseModel):
+    heading: str
+    dish_name: str
+    ingredients: list[str] = Field(default_factory=list)
+    techniques: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class ChunkMetadata(BaseModel):
+    restaurant_name: str | None = None
+    chef_name: str | None = None
+    summary: str | None = None
+    dish_info: DishInfo | None = None
+    source_path: str | None = None
+    category: str | None = None
+    provider: str | None = None
+    # aggiungi altri campi noti qui
+
+
+class ChunkPayload(BaseModel):
+    id: str = Field(..., description="Unique identifier for the chunk.")
+    text: str = Field(..., description="Text content of the chunk.")
+    metadata: ChunkMetadata = Field(
+        ..., description="Metadata associated with the chunk."
+    )
+
+    @classmethod
+    def from_chunk(cls, chunk: Chunk) -> ChunkPayload:
+        return cls(
+            id=chunk.id, text=chunk.text, metadata=ChunkMetadata(**chunk.metadata)
+        )
+
+    def to_chunk(self) -> Chunk:
+        return Chunk(
+            id=self.id,
+            text=self.text,
+            metadata=self.metadata.model_dump(exclude_none=True),
+        )
+
+
+class RelevantChunk(BaseModel):
+    #
+    relevant: bool = Field(
+        ..., description="Indicates if the chunk is relevant to the query."
+    )
+
+
+class ChunkReranker(PipelineComponent):
+    def __init__(self, client: OpenAILikeClient | None = None):
+        self.client = client
+        self.prompt = (
+            "Sei un assistente intelligente che identifica quali chunk sono rilevanti per rispondere alla domanda dell'utente."
+            "Di se il chunk e' rilevante o meno\n\n"
+            "Domanda dell'utente:\n"
+            "{user_prompt}\n\n"
+            "Chunk:\n"
+            "{chunk}\n\n"
+            "Concentrati sul capire se la domanda dell'utente puo' essere risolta usando le informazioni presenti nel chunk. (ingredienti, tecniche, ristorante, chef, descrizione del piatto)."
+            "Se la domanda fa riferimento ad un ingredeinte di un piatto ad esempio cerca se fra quei ingredienti c'e' quello richiesto."
+        )
+
+    def _run(
+        self, user_prompt: str | None = None, chunks: list[Chunk] | None = None
+    ) -> list[Chunk]:
+        if not chunks:
+            return []
+        if not self.client or not user_prompt:
+            return chunks
+
+        chunks_data = [ChunkPayload.from_chunk(chunk) for chunk in chunks]
+        relevant_chunks: list[Chunk] = []
+        logger.info(f"Reranking  chunk")
+        for chunk_data in chunks_data:
+            try:
+                response = self.client.structured_response(
+                    input=self.prompt.format(user_prompt=user_prompt, chunk=chunk_data),
+                    output_cls=RelevantChunk,
+                )
+                if response.structured_data:
+                    relevant_chunk: RelevantChunk = response.structured_data[0]
+                    if relevant_chunk.relevant:
+                        relevant_chunks.append(chunk_data.to_chunk())
+
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Chunk reranker failed: %s", exc)
+                relevant_chunks.append(chunk_data.to_chunk())
+        return relevant_chunks
+
+
 class FilterExtractor(PipelineComponent):
     """Use an LLM to derive metadata filters for the retriever."""
 
     def __init__(self, client: OpenAILikeClient | None = None):
         self.client = client
         self.prompt = (
-        "Estrai eventuali ingredienti, tecniche, ristoranti o chef citati dalla seguente richiesta.\n"
-        "Rispondi solo con JSON della forma {{\"ingredients\": [], \"techniques\": [], \"restaurant\": [], \"chef\": []}}.\n"
-        "Usa esattamente questi nomi di chiave anche se gli array rimangono vuoti e non aggiungere testo libero.\n\n"
-        "Esempi:\n"
-        "Domanda: Quali sono i piatti che includono le Chocobo Wings come ingrediente?\n"
-        'Risposta: {{"ingredients": ["Chocobo Wings"], "techniques": [], "restaurant": [], "chef": []}}\n\n'
-        "Domanda: Quali piatti dovrei scegliere per un banchetto a tema magico che includa le celebri Cioccorane?\n"
-        'Risposta: {{"ingredients": ["Cioccorane"], "techniques": [], "restaurant": [], "chef": []}}\n\n'
-        "Domanda: Quali piatti usano la Sferificazione Filamentare a Molecole Vibrazionali, ma evitano la Decostruzione Magnetica Risonante?\n"
-        'Risposta: {{"ingredients": [], "techniques": ["Sferificazione Filamentare a Molecole Vibrazionali"], "restaurant": [], "chef": []}}\n\n'
-        "Domanda da cui devi estrarre i dati: {question}\n"
-    )
-
+            "Estrai eventuali ingredienti, tecniche, ristoranti o chef citati dalla seguente richiesta.\n"
+            'Rispondi solo con JSON della forma {{"ingredients": [], "techniques": [], "restaurant": [], "chef": []}}.\n'
+            "Usa esattamente questi nomi di chiave anche se gli array rimangono vuoti e non aggiungere testo libero.\n\n"
+            "Esempi:\n"
+            "Domanda: Quali sono i piatti che includono le Chocobo Wings come ingrediente?\n"
+            'Risposta: {{"ingredients": ["Chocobo Wings"], "techniques": [], "restaurant": [], "chef": []}}\n\n'
+            "Domanda: Quali piatti dovrei scegliere per un banchetto a tema magico che includa le celebri Cioccorane?\n"
+            'Risposta: {{"ingredients": ["Cioccorane"], "techniques": [], "restaurant": [], "chef": []}}\n\n'
+            "Domanda: Quali piatti usano la Sferificazione Filamentare a Molecole Vibrazionali, ma evitano la Decostruzione Magnetica Risonante?\n"
+            'Risposta: {{"ingredients": [], "techniques": ["Sferificazione Filamentare a Molecole Vibrazionali"], "restaurant": [], "chef": []}}\n\n'
+            "Domanda da cui devi estrarre i dati: {question}\n"
+        )
 
     def _run(self, user_prompt: str | None = None) -> dict | None:
         if not self.client or not user_prompt:
@@ -145,6 +234,7 @@ class FilterExtractor(PipelineComponent):
         if not response.structured_data:
             return None
         spec: FilterSpec = response.structured_data[0]
+        logger.info("Extracted filter spec: %s", spec.model_dump())
         return self._build_filter(spec)
 
     def _build_filter(self, spec: FilterSpec) -> dict | None:
@@ -179,6 +269,15 @@ def build_rag_pipeline(
         temperature=0.0,
         base_url=settings.base_url,
     )
+
+    reranker_client = OpenAILikeClient(
+        api_key=settings.api_key,
+        model=settings.llm_model,
+        system_prompt="Sei un assistente intelligente che identifica quali chunk sono rilevanti per rispondere alla domanda dell'utente.",
+        temperature=0.0,
+        base_url=settings.base_url,
+    )
+
     rewriter = ToolRewriter(
         client=rewriter_client,
         system_prompt=REWRITER_SYSTEM_PROMPT,
@@ -199,7 +298,9 @@ def build_rag_pipeline(
             model_name=settings.embedding_model,
             base_url=settings.base_url,
         )
-    query_embedder = QueryEmbedder(embedder=embedder_client, model_name=settings.embedding_model)
+    query_embedder = QueryEmbedder(
+        embedder=embedder_client, model_name=settings.embedding_model
+    )
 
     prompt_template = ChatPromptTemplate(
         user_prompt_template=USER_PROMPT_TEMPLATE,
@@ -220,23 +321,35 @@ def build_rag_pipeline(
 
     filter_extractor = FilterExtractor(client=rewriter_client)
 
+    chunk_classifier = ChunkReranker(client=reranker_client)
+
     pipeline = DagPipeline()
     pipeline.add_module("rewriter", rewriter)
     pipeline.add_module("filter_builder", filter_extractor)
     pipeline.add_module("query_embedder", query_embedder)
     pipeline.add_module("retriever", vectorstore.as_retriever())
     pipeline.add_module("prompt_builder", prompt_builder)
+    pipeline.add_module("chunk_classifier", chunk_classifier)
     pipeline.add_module("generator", generator)
     pipeline.add_module("postprocess", postprocess)
 
     pipeline.connect("rewriter", "query_embedder", target_key="text")
     pipeline.connect("rewriter", "prompt_builder", target_key="retrieval_query")
-    # pipeline.connect("filter_builder", "retriever", target_key="query_filter")
+    pipeline.connect("rewriter", "chunk_classifier", target_key="user_prompt")
+    pipeline.connect("filter_builder", "retriever", target_key="query_filter")
     pipeline.connect("query_embedder", "retriever", target_key="query_vector")
-    pipeline.connect("retriever", "prompt_builder", target_key="chunks")
+
+    pipeline.connect("retriever", "chunk_classifier", target_key="chunks")
+
+    pipeline.connect("chunk_classifier", "prompt_builder", target_key="chunks")
     pipeline.connect("prompt_builder", "generator", target_key="memory")
-    pipeline.connect("retriever", "postprocess", target_key="chunks")
+
+    pipeline.connect("chunk_classifier", "postprocess", target_key="chunks")
     pipeline.connect("generator", "postprocess", target_key="response")
 
-    logger.info("RAG pipeline ready: provider=%s, collection=%s", settings.provider, settings.qdrant_collection)
+    logger.info(
+        "RAG pipeline ready: provider=%s, collection=%s",
+        settings.provider,
+        settings.qdrant_collection,
+    )
     return pipeline

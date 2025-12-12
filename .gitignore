@@ -9,5 +9,4 @@ setup.md
 notebooks/*
 
 .env
-Dataset/
-data/
+data/docling_json/

@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 import typer
-
 from datapizza.vectorstores.qdrant import QdrantVectorstore
 
 from galactic_rag import Settings, get_settings
@@ -43,7 +42,6 @@ def answer(
     limit: int = typer.Option(0, help="Max number of questions to answer (0 = all)."),
     skip: int = typer.Option(0, help="Number of questions to skip from the top."),
     top_k: int = typer.Option(6, help="How many chunks to retrieve per query."),
-    max_tokens: int = typer.Option(800, help="Max tokens for the answering model."),
 ):
     """Answer the questions with the configured RAG pipeline."""
 

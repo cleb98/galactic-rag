@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from datapizza.core.clients.models import ClientResponse
 from datapizza.core.models import PipelineComponent
@@ -33,32 +33,35 @@ class DishPostProcessor(PipelineComponent):
     ) -> dict[str, object]:
         dish_names = self._extract_dish_names(response)
         if not dish_names:
-            dish_names = self._fallback_from_chunks(chunks)
+            #
+            return {
+                "result": "",
+                "dishes": [],
+                "row_id": row_id,
+                "question": question,
+                "difficulty": difficulty,
+            }
 
         dish_ids = self._map_to_ids(dish_names)
         if not dish_ids:
-            fallback_names = self._fallback_from_chunks(chunks)
-            dish_ids = self._map_to_ids(fallback_names)
-            if fallback_names:
-                dish_names = fallback_names
-
-        if not dish_ids and self._name_to_id:
-            # deterministic final fallback: take the first available ID
-            dish_ids = [next(iter(self._name_to_id.values()))]
-            logger.warning(
-                "Falling back to default dish ID for row %s (question=%s)",
-                row_id,
-                question,
-            )
+            return {
+                "result": "",
+                "dishes": "",
+                "row_id": row_id,
+                "question": question,
+                "difficulty": difficulty,
+            }
 
         result = ",".join(str(idx) for idx in dish_ids)
-        return {
+        out = {
             "result": result,
             "dishes": dish_names,
             "row_id": row_id,
             "question": question,
             "difficulty": difficulty,
         }
+        logger.info(F"DOMANDA {row_id}: {out}")
+        return out
 
     def _load_mapping(self, path: Path) -> dict[str, int]:
         if not path.exists():
@@ -78,7 +81,7 @@ class DishPostProcessor(PipelineComponent):
             try:
                 parsed = json.loads(json_blob)
             except json.JSONDecodeError:
-                logger.debug("Could not decode JSON blob: %s", json_blob)
+                logger.info("Could not decode JSON blob: %s", json_blob)
             else:
                 return self._names_from_parsed(parsed)
 
@@ -120,25 +123,6 @@ class DishPostProcessor(PipelineComponent):
         cleaned = [v.strip(" \n\t\"')") for v in value.split(",")]
         return [v for v in cleaned if v]
 
-    def _fallback_from_chunks(self, chunks: Sequence[Chunk] | None) -> list[str]:
-        if not chunks:
-            return []
-        candidates: list[str] = []
-        for chunk in chunks[: self.fallback_chunks]:
-            metadata = chunk.metadata or {}
-            dish_name = metadata.get("dish_name")
-            if not dish_name:
-                menu_info = metadata.get("menu_info")
-                if isinstance(menu_info, dict):
-                    dish_name = menu_info.get("dish_name")
-            if not dish_name:
-                structured = metadata.get("structured_text") or ""
-                match = re.search(r"Piatto:\s*(.+)", structured)
-                if match:
-                    dish_name = match.group(1).strip()
-            if dish_name:
-                candidates.append(dish_name)
-        return candidates
 
     def _map_to_ids(self, names: Sequence[str]) -> list[int]:
         ids: list[int] = []
@@ -148,7 +132,7 @@ class DishPostProcessor(PipelineComponent):
             if dish_id is not None:
                 ids.append(dish_id)
             else:
-                logger.debug("Dish '%s' not found in mapping", name)
+                logger.info("Dish '%s' not found in mapping", name)
         return ids
 
     @staticmethod
