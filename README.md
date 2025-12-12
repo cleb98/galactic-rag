@@ -3,6 +3,8 @@
 Pragmatic tooling that ingests the Hackapizza knowledge base with Datapizza AI and runs a Retrieval-Augmented Generation pipeline to answer every question.
 Are only supported the ingestion of menu PDFs in the Dataset/knowledge_base/menu and the RAG pipeline to answer questions about them.
 
+> The pipeline should reach a Jaccard similarity score: 25.6183% on the provided domande.csv dataset when using OpenAI as provider.
+
 ## Quick start
 
 1. Create and activate the virtual environment with uv (Python 3.12+ recommended):
@@ -18,7 +20,7 @@ Are only supported the ingestion of menu PDFs in the Dataset/knowledge_base/menu
    ```bash
    uv sync
    ```
-   or if youi want to work in development mode:
+   or if you want to work in development mode:
    ```bash
    uv sync --group dev
 

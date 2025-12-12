@@ -110,6 +110,28 @@ class PromptBuilder(PipelineComponent):
         )
 
 
+class SafeToolRewriter(PipelineComponent):
+    """Wrapper for ToolRewriter that falls back to the original prompt on failure."""
+
+    def __init__(self, rewriter: ToolRewriter):
+        self.rewriter = rewriter
+
+    def _run(
+        self, user_prompt: str | None = None, memory: Memory | None = None, **kwargs
+    ) -> str:
+        if not user_prompt:
+            return ""
+        try:
+            return self.rewriter.rewrite(user_prompt=user_prompt, memory=memory)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ToolRewriter failed for query '%s'. Returning original prompt. Error: %s",
+                user_prompt,
+                exc,
+            )
+            return user_prompt
+
+
 class DishInfo(BaseModel):
     heading: str
     dish_name: str
@@ -341,13 +363,14 @@ def build_rag_pipeline(
         base_url=settings.base_url,
     )
 
-    rewriter = ToolRewriter(
+    base_rewriter = ToolRewriter(
         client=rewriter_client,
         system_prompt=REWRITER_SYSTEM_PROMPT,
         tool_choice="required",
         tool_output_name="query",
         temperature=0.0,
     )
+    rewriter = SafeToolRewriter(base_rewriter)
 
     if settings.provider == "gemini":
         embedder_client = GoogleEmbedder(
